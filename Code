@@ -1,0 +1,481 @@
+rm(list = ls())
+install.packages(c("tidyverse", "caret", "randomForest", "xgboost", "pROC", 
+                   "dplyr",”ggplot2”,”patchwork”))
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+setwd("C:/Users/User/Desktop/10/heluo/")
+
+# Load and prepare data
+billboard_data <- read_csv("billboard_24years_lyrics_spotify.csv")
+acoustic_features <- read_delim("acoustic_features.csv", delim = "\t")
+
+# Create extended dataset
+billboard_with_ids <- billboard_data %>%
+  mutate(song_id = str_remove(uri, "spotify:track:"))
+
+extended_data <- billboard_with_ids %>%
+  left_join(acoustic_features, by = "song_id", suffix = c("_billboard", "_acoustic"))
+
+# Select features
+audio_features <- c("danceability", "energy", "valence", "acousticness", 
+                    "liveness", "speechiness", "tempo", "loudness")
+
+extended_data <- extended_data %>%
+  mutate(
+    danceability = coalesce(danceability_acoustic, danceability_billboard),
+    energy = coalesce(energy_acoustic, energy_billboard),
+    valence = coalesce(valence_acoustic, valence_billboard),
+    acousticness = coalesce(acousticness_acoustic, acousticness_billboard),
+    liveness = coalesce(liveness_acoustic, liveness_billboard),
+    speechiness = coalesce(speechiness_acoustic, speechiness_billboard),
+    tempo = coalesce(tempo_acoustic, tempo_billboard),
+    loudness = coalesce(loudness_acoustic, loudness_billboard)
+  )
+
+# Create imbalanced dataset
+all_positive_samples <- extended_data %>%
+  filter(!is.na(ranking), ranking <= 100) %>%
+  filter(complete.cases(select(., all_of(audio_features)))) %>%
+  mutate(target = 1)
+
+all_negative_samples <- acoustic_features %>%
+  filter(complete.cases(select(., all_of(audio_features)))) %>%
+  anti_join(all_positive_samples, by = "song_id") %>%
+  mutate(target = 0, ranking = NA, year = sample(2000:2023, n(), replace = TRUE))
+
+full_data <- bind_rows(
+  all_positive_samples %>% select(song_id, target, ranking, year, all_of(audio_features)),
+  all_negative_samples %>% select(song_id, target, ranking, year, all_of(audio_features))
+)
+
+# DESCRIPTIVE STATISTICS ANALYSIS
+
+# Data structure overview
+cat("Data dimensions:", dim(full_data), "\n")
+cat("Column names:", colnames(full_data), "\n")
+
+# View data structure
+str(full_data)
+summary(full_data)
+
+group_stats_table <- full_data %>%
+  group_by(target) %>%
+  summarise(across(all_of(audio_features), 
+                   list(mean = ~mean(., na.rm = TRUE),
+                        sd = ~sd(., na.rm = TRUE),
+                        median = ~median(., na.rm = TRUE)), 
+                   .names = "{.col}_{.fn}")) %>%
+  pivot_longer(cols = -target, names_to = "stat", values_to = "value") %>%
+  separate(stat, into = c("feature", "statistic"), sep = "_") %>%
+  pivot_wider(names_from = c(target, statistic), values_from = value) %>%
+  rename(Feature = feature)
+group_stats_table <- group_stats_table %>%
+  rename_with(~ stringr::str_replace(., "^0_", "NonBillboard_"), .cols = contains("0_")) %>%
+  rename_with(~ stringr::str_replace(., "^1_", "Billboard_"), .cols = contains("1_"))
+
+print(group_stats_table, width = Inf)
+
+# Missing value analysis
+missing_values <- colSums(is.na(full_data))
+missing_percentage <- (missing_values / nrow(full_data)) * 100
+
+# Create missing value data frame
+missing_df <- data.frame(
+  Variable = names(missing_values),
+  Missing_Count = missing_values,
+  Missing_Percentage = missing_percentage
+)
+
+# Sort by missing percentage
+missing_df <- missing_df[order(-missing_df$Missing_Percentage), ]
+
+# Print missing value statistics
+print("Missing Value Statistics:")
+print(missing_df)
+
+# Visualize missing values
+library(naniar)
+gg_miss_var(full_data) +
+  labs(title = "Missing Values by Variable", x = "Number of Missing Values", y = "Variable") +
+  theme_minimal()
+
+# Target variable distribution analysis
+target_distribution <- table(full_data$target)
+target_percentage <- prop.table(target_distribution) * 100
+
+# Print target variable distribution
+cat("Target Variable Distribution:\n")
+print(target_distribution)
+cat("Target Variable Percentage:\n")
+print(target_percentage)
+
+# Visualize target variable distribution
+ggplot(full_data, aes(x = factor(target), fill = factor(target))) +
+  geom_bar(alpha = 0.8) +
+  labs(title = "Target Variable (target) Distribution", x = "Target Value", y = "Frequency") +
+  theme_minimal() +
+  scale_fill_manual(values = c("#E41A1C", "#377EB8"))
+
+# Audio features descriptive statistics
+audio_features <- c("danceability", "energy", "valence", "acousticness", 
+                    "liveness", "speechiness", "tempo", "loudness")
+
+# Generate descriptive statistics table
+desc_stats <- full_data %>%
+  select(all_of(audio_features)) %>%
+  summary()
+
+print("Audio Features Descriptive Statistics:")
+print(desc_stats)
+
+# Visualize audio features distribution
+library(patchwork)
+plots <- list()
+for (feature in audio_features) {
+  plots[[feature]] <- ggplot(full_data, aes(x = .data[[feature]])) +
+    geom_histogram(binwidth = 0.1, fill = "#4DAF4A", alpha = 0.8) +
+    labs(title = paste(feature, "Distribution"), x = feature, y = "Frequency") +
+    theme_minimal()
+}
+
+# Combine all distribution plots
+combined_dist_plots <- wrap_plots(plots, ncol = 2)
+print(combined_dist_plots)
+
+#  Audio features correlation analysis
+# Calculate correlation matrix
+cor_matrix <- cor(full_data[audio_features], use = "complete.obs")
+
+# Print correlation matrix
+print("Audio Features Correlation Matrix:")
+print(cor_matrix)
+
+# Visualize correlation heatmap
+library(corrplot)
+corrplot(cor_matrix, method = "color", addCoef.col = "black",
+         title = "Audio Features Correlation Heatmap", is.corr = TRUE)
+
+#  Time trend analysis
+# Analyze target variable distribution by year
+yearly_target <- full_data %>%
+  filter(!is.na(year)) %>%
+  group_by(year) %>%
+  summarise(
+    total = n(),
+    positive = sum(target),
+    positive_rate = positive / total * 100
+  )
+
+# Print yearly target variable statistics
+print("Yearly Target Variable Statistics:")
+print(yearly_target)
+
+# Visualize target variable trend over time
+ggplot(yearly_target, aes(x = year, y = positive_rate)) +
+  geom_line(color = "#FF7F00", size = 1.5) +
+  geom_point(size = 2, color = "#FF7F00") +
+  labs(title = "Target Variable Trend Over Time", x = "Year", y = "Positive Sample Rate (%)") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(min(yearly_target$year), max(yearly_target$year), by = 2))
+
+#  Audio features and target variable relationship
+# Create feature-target variable relationship plots
+feature_target_plots <- list()
+for (feature in audio_features) {
+  feature_target_plots[[feature]] <- ggplot(full_data, aes(x = factor(target), y = .data[[feature]])) +
+    geom_boxplot(fill = c("#377EB8", "#E41A1C"), alpha = 0.8) +
+    labs(title = paste(feature, "vs Target Variable"), x = "Target Value", y = feature) +
+    theme_minimal()
+}
+
+# Combine all relationship plots
+combined_feature_target <- wrap_plots(feature_target_plots, ncol = 2)
+print(combined_feature_target)
+
+# Train-test split
+set.seed(123)
+train_index <- createDataPartition(full_data$target, p = 0.7, list = FALSE)
+train_full <- full_data[train_index, ]
+test_full <- full_data[-train_index, ]
+
+# Prepare data for models
+x_train_full <- as.matrix(train_full[audio_features])
+y_train_full <- as.factor(train_full$target)
+x_test_full <- as.matrix(test_full[audio_features])
+y_test_full <- as.factor(test_full$target)
+
+#  Logistic Regression
+logit_full <- glm(target ~ ., data = train_full[c("target", audio_features)], 
+                  family = binomial(link = "logit"))
+
+# Fix ROC calculation
+test_full$target_factor <- factor(test_full$target, levels = c(0, 1))
+logit_prob <- predict(logit_full, newdata = test_full, type = "response")
+
+logit_roc <- pROC::roc(
+  response = test_full$target_factor,
+  predictor = logit_prob,
+  levels = c("0", "1"),
+  direction = "<"
+)
+logit_auc <- auc(logit_roc)
+
+logit_pred <- as.integer(logit_prob > 0.5)
+logit_cm <- table(Predicted = logit_pred, Actual = test_full$target)
+logit_accuracy <- sum(diag(logit_cm)) / sum(logit_cm)
+
+# Random Forest
+set.seed(123)
+rf_full <- randomForest(
+  x = x_train_full,
+  y = y_train_full,
+  ntree = 500,
+  importance = TRUE
+)
+
+rf_pred <- predict(rf_full, x_test_full)
+rf_prob <- predict(rf_full, x_test_full, type = "prob")[,2]
+
+rf_roc <- pROC::roc(
+  response = test_full$target_factor,
+  predictor = rf_prob,
+  levels = c("0", "1"),
+  direction = "<"
+)
+rf_auc <- auc(rf_roc)
+
+rf_cm <- table(Predicted = rf_pred, Actual = y_test_full)
+rf_accuracy <- sum(diag(rf_cm)) / sum(rf_cm)
+
+#  XGBoost
+positive_count <- sum(train_full$target)
+negative_count <- sum(1 - train_full$target)
+scale_pos_weight <- negative_count / positive_count
+
+dtrain_full <- xgb.DMatrix(data = x_train_full, label = as.numeric(y_train_full) - 1)
+dtest_full <- xgb.DMatrix(data = x_test_full, label = as.numeric(y_test_full) - 1)
+
+xgb_params_full <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.1,
+  scale_pos_weight = scale_pos_weight
+)
+
+xgb_full <- xgb.train(params = xgb_params_full, data = dtrain_full, nrounds = 100, verbose = 0)
+xgb_prob <- predict(xgb_full, dtest_full)
+
+xgb_roc <- pROC::roc(
+  response = test_full$target_factor,
+  predictor = xgb_prob,
+  levels = c("0", "1"),
+  direction = "<"
+)
+xgb_auc <- auc(xgb_roc)
+
+xgb_pred <- as.integer(xgb_prob > 0.5)
+xgb_cm <- table(Predicted = xgb_pred, Actual = as.numeric(y_test_full) - 1)
+xgb_accuracy <- sum(diag(xgb_cm)) / sum(xgb_cm)
+
+
+# Logistic Regression
+logit_precision <- posPredValue(as.factor(logit_pred), test_full$target_factor, positive = "1")
+logit_recall <- sensitivity(as.factor(logit_pred), test_full$target_factor, positive = "1")
+logit_f1 <- (2 * logit_precision * logit_recall) / (logit_precision + logit_recall)
+
+# Random Forest
+rf_precision <- posPredValue(rf_pred, y_test_full, positive = "1")
+rf_recall <- sensitivity(rf_pred, y_test_full, positive = "1")
+rf_f1 <- (2 * rf_precision * rf_recall) / (rf_precision + rf_recall)
+
+# XGBoost
+xgb_pred_factor <- factor(xgb_pred, levels = c(0, 1))
+y_test_numeric <- as.numeric(y_test_full) - 1
+y_test_factor <- factor(y_test_numeric, levels = c(0, 1))
+
+xgb_precision <- posPredValue(xgb_pred_factor, y_test_factor, positive = "1")
+xgb_recall <- sensitivity(xgb_pred_factor, y_test_factor, positive = "1")
+xgb_f1 <- (2 * xgb_precision * xgb_recall) / (xgb_precision + xgb_recall)
+
+
+results <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "XGBoost"),
+  Accuracy = c(logit_accuracy, rf_accuracy, xgb_accuracy),
+  AUC = c(logit_auc, rf_auc, xgb_auc),
+  Precision = c(logit_precision, rf_precision, xgb_precision),
+  Recall = c(logit_recall, rf_recall, xgb_recall),
+  F1_Score = c(logit_f1, rf_f1, xgb_f1)
+)
+print(results)
+
+
+# INDIVIDUAL FEATURE IMPORTANCE PLOTS
+
+#  Logistic Regression Feature Importance (Coefficient Magnitude)
+logit_coef <- summary(logit_full)$coefficients[-1, ]  # Remove intercept
+logit_importance <- data.frame(
+  Feature = rownames(logit_coef),
+  Importance = abs(logit_coef[, 1]),  # Use absolute coefficient values
+  Significance = ifelse(logit_coef[, 4] < 0.05, "p < 0.05", "p ≥ 0.05")
+)
+
+p_logit <- ggplot(logit_importance, aes(x = reorder(Feature, Importance), y = Importance, 
+                                        fill = Significance)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  scale_fill_manual(values = c("p < 0.05" = "#E41A1C", "p ≥ 0.05" = "#377EB8")) +
+  coord_flip() +
+  labs(title = "Logistic Regression: Feature Importance",
+       subtitle = "Based on absolute coefficient values",
+       x = "Audio Features", 
+       y = "|Coefficient Value|") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+#  Random Forest Feature Importance (Mean Decrease Gini)
+rf_importance <- importance(rf_full)
+rf_importance_df <- data.frame(
+  Feature = rownames(rf_importance),
+  Importance = rf_importance[, "MeanDecreaseGini"]
+)
+
+p_rf <- ggplot(rf_importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#4DAF4A", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Random Forest: Feature Importance", 
+       subtitle = "Based on Mean Decrease Gini",
+       x = "Audio Features", 
+       y = "Mean Decrease Gini") +
+  theme_minimal()
+
+#  XGBoost Feature Importance (Gain)
+xgb_imp <- xgb.importance(model = xgb_full)
+xgb_importance_df <- data.frame(
+  Feature = xgb_imp$Feature,
+  Importance = xgb_imp$Gain
+)
+
+p_xgb <- ggplot(xgb_importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#FF7F00", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "XGBoost: Feature Importance",
+       subtitle = "Based on Gain metric", 
+       x = "Audio Features",
+       y = "Gain") +
+  theme_minimal()
+
+
+# COMBINE ALL PLOTS
+
+# Arrange all three plots together
+combined_plot <- p_logit / p_rf / p_xgb +
+  plot_annotation(title = "Feature Importance Analysis: Billboard Hot 100 Prediction",
+                  theme = theme(plot.title = element_text(size = 14, face = "bold")))
+
+# Display the combined plot
+print(combined_plot)
+
+# Save the combined visualization
+ggsave("Individual_Feature_Importance_Plots.png", combined_plot, 
+       width = 12, height = 15, dpi = 300)
+
+
+# ALTERNATIVE: SIDE-BY-SIDE COMPARISON
+
+# Normalize importance scores for better comparison
+normalize_importance <- function(importance_df) {
+  importance_df$Importance_Normalized <- importance_df$Importance / max(importance_df$Importance)
+  return(importance_df)
+}
+
+# Apply normalization to all datasets
+logit_norm <- normalize_importance(logit_importance)
+rf_norm <- normalize_importance(rf_importance_df)
+xgb_norm <- normalize_importance(xgb_importance_df)
+
+# Add model identifiers
+logit_norm$Model <- "Logistic Regression"
+rf_norm$Model <- "Random Forest" 
+xgb_norm$Model <- "XGBoost"
+
+# Combine all data
+all_importance <- bind_rows(logit_norm, rf_norm, xgb_norm)
+
+# Create side-by-side comparison plot
+p_comparison <- ggplot(all_importance, 
+                       aes(x = reorder(Feature, Importance_Normalized), 
+                           y = Importance_Normalized, 
+                           fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  coord_flip() +
+  scale_fill_manual(values = c("Logistic Regression" = "#E41A1C",
+                               "Random Forest" = "#4DAF4A", 
+                               "XGBoost" = "#FF7F00")) +
+  labs(title = "Normalized Feature Importance Comparison",
+       subtitle = "All scores normalized to 0-1 range for direct comparison",
+       x = "Audio Features",
+       y = "Normalized Importance Score (0-1)",
+       fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Save comparison plot
+ggsave("Normalized_Feature_Importance_Comparison.png", p_comparison, 
+       width = 14, height = 8, dpi = 300)
+
+# Display individual plots
+print(p_logit)
+print(p_rf) 
+print(p_xgb)
+print(p_comparison)
+
+combined_importance <- bind_rows(
+  # Logistic
+  data.frame(
+    Feature = rownames(summary(logit_full)$coefficients)[-1], # 去除截距项
+    Importance = abs(summary(logit_full)$coefficients[-1, 1]), # 取系数绝对值
+    Model = "Logistic Regression"
+  ),
+  
+  # RF
+  data.frame(
+    Feature = rownames(importance(rf_full)),
+    Importance = importance(rf_full)[, "MeanDecreaseGini"],
+    Model = "Random Forest"
+  ),
+  
+  # XGBoost
+  data.frame(
+    Feature = xgb.importance(model = xgb_full)$Feature,
+    Importance = xgb.importance(model = xgb_full)$Gain,
+    Model = "XGBoost"
+  )
+)
+
+
+combined_importance <- combined_importance %>%
+  group_by(Model) %>%
+  mutate(Importance_Normalized = Importance / max(Importance)) %>%
+  ungroup()
+
+ggplot(combined_importance, aes(x = Feature, y = Importance_Normalized, fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge(0.8), width = 0.7) +
+  scale_fill_manual(values = c("Logistic Regression" = "#E41A1C", 
+                               "Random Forest" = "#4DAF4A", 
+                               "XGBoost" = "#FF7F00")) +
+  labs(title = "Comparative Feature Importance Analysis",
+       subtitle = "Normalized Importance Scores (0-1 scale)",
+       x = "Audio Features", 
+       y = "Normalized Importance Score",
+       fill = "Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top") +
+  coord_flip() 
