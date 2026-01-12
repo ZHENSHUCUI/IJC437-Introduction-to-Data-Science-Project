@@ -439,8 +439,8 @@ print(p_comparison)
 combined_importance <- bind_rows(
   # Logistic
   data.frame(
-    Feature = rownames(summary(logit_full)$coefficients)[-1], # 去除截距项
-    Importance = abs(summary(logit_full)$coefficients[-1, 1]), # 取系数绝对值
+    Feature = rownames(summary(logit_full)$coefficients)[-1], 
+    Importance = abs(summary(logit_full)$coefficients[-1, 1]), 
     Model = "Logistic Regression"
   ),
   
